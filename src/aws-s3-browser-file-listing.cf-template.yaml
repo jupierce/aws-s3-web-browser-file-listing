@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ""
+Parameters:
+    s3BucketName:
+        Type: "String"
+
+Resources:
+    IAMManagedPolicy:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: !Sub "${S3Bucket}-server-lambdas"
+            Path: "/service-role/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "logs:CreateLogGroup",
+                            "Resource": "arn:aws:logs:*:*:*"
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:GetObject",
+                                "s3:ListBucket"
+                            ],
+                            "Resource": [
+                                "arn:aws:s3:::${S3Bucket}"
+                            ]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents"
+                            ],
+                            "Resource": [
+                                "arn:aws:logs:*:*:log-group:*:*"
+                            ]
+                        }
+                    ]
+                }
+
+    BasicAuthPolicy:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: !Sub "${S3Bucket}-basic-auth"
+            Path: "/"
+            PolicyDocument: !Sub |
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "secretsmanager:GetSecretValue",
+                                "s3:ListBucket"
+                            ],
+                            "Resource": [
+                                "arn:aws:s3:::${S3Bucket}",
+                                "arn:aws:secretsmanager:*:${AWS::AccountId}:secret:${S3Bucket}-basic-auth/*"
+                            ]
+                        }
+                    ]
+                }
+
+    S3Bucket:
+        Type: "AWS::S3::Bucket"
+        Properties:
+            BucketName: !Ref s3BucketName
+            BucketEncryption:
+                ServerSideEncryptionConfiguration:
+                  -
+                    ServerSideEncryptionByDefault:
+                        SSEAlgorithm: "AES256"
+                    BucketKeyEnabled: true
+            LifecycleConfiguration:
+                Rules:
+                  -
+                    Id: "perm remove deleted"
+                    Status: "Enabled"
+                    NoncurrentVersionExpirationInDays: 60
+                  -
+                    Id: "intelligent storage classes"
+                    Status: "Enabled"
+                    Transitions:
+                      -
+                        TransitionInDays: 0
+                        StorageClass: "INTELLIGENT_TIERING"
+            VersioningConfiguration:
+                Status: "Enabled"
+
+    S3BucketPolicy:
+        Type: "AWS::S3::BucketPolicy"
+        Properties:
+            Bucket: !Ref S3Bucket
+            PolicyDocument:
+                Version: "2008-10-17"
+                Id: "PolicyForCloudFrontPrivateContent"
+                Statement:
+                  -
+                    Sid: "1"
+                    Effect: "Allow"
+                    Principal:
+                        CanonicalUser: !GetAtt CloudFrontCloudFrontOriginAccessIdentity.S3CanonicalUserId
+                    Action: "s3:GetObject"
+                    Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+
+    BasicAuthLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: "Implements basic routing and auth if desired"
+            FunctionName: !Sub "${S3Bucket}-basic-auth"
+            Handler: "index.lambda_handler"
+            Architectures:
+              - "x86_64"
+            Code:
+                ZipFile: !Sub |
+                    INJECT basic-auth-lambda.py
+            MemorySize: 128
+            Role: !GetAtt BasicAuthRole.Arn
+            Runtime: "python3.8"
+            Timeout: 5
+            TracingConfig:
+                Mode: "PassThrough"
+            EphemeralStorage:
+                Size: 512
+
+    IndexGenLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${S3Bucket}-s3-get-index-html-gen"
+            Handler: "index.lambda_handler"
+            Architectures:
+              - "x86_64"
+            Code:
+                ZipFile: !Sub |
+                    INJECT s3-get-index-html-gen-lambda.py
+            MemorySize: 256
+            Role: !GetAtt IndexGenRole.Arn
+            Runtime: "python3.8"
+            Timeout: 30
+            TracingConfig:
+                Mode: "PassThrough"
+            EphemeralStorage:
+                Size: 512
+
+    RedirectToBareLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Description: ""
+            FunctionName: !Sub "${S3Bucket}-redirect-bare-to-index-html"
+            Handler: "index.lambda_handler"
+            Architectures:
+              - "x86_64"
+            Code:
+                ZipFile: !Sub |
+                  INJECT redirect-bare-to-index-html-lambda.py
+            MemorySize: 128
+            Role: !GetAtt RedirectHtmlRole.Arn
+            Runtime: "python3.8"
+            Timeout: 3
+            TracingConfig:
+                Mode: "PassThrough"
+            EphemeralStorage:
+                Size: 512
+
+    CloudFrontDistribution:
+        Type: "AWS::CloudFront::Distribution"
+        Properties:
+            DistributionConfig:
+                Origins:
+                  -
+                    ConnectionAttempts: 3
+                    ConnectionTimeout: 10
+                    DomainName: !Sub "${S3Bucket}.s3.amazonaws.com"
+                    Id: !Sub "S3-${S3Bucket}"
+                    OriginPath: ""
+                    S3OriginConfig:
+                        OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontCloudFrontOriginAccessIdentity}"
+                DefaultCacheBehavior:
+                    AllowedMethods:
+                      - "HEAD"
+                      - "GET"
+                    CachedMethods:
+                      - "HEAD"
+                      - "GET"
+                    Compress: false
+                    CachePolicyId: "658327ea-f89d-4fab-a63d-7e88639e58f6"
+                    LambdaFunctionAssociations:
+                      -
+                        EventType: "origin-response"
+                        LambdaFunctionARN: !Ref RedirectToBareLambdaFunctionVersion
+                      -
+                        EventType: "viewer-request"
+                        LambdaFunctionARN: !Ref BasicAuthLambdaFunctionVersion
+                    SmoothStreaming: false
+                    TargetOriginId: !Sub "S3-${S3Bucket}"
+                    ViewerProtocolPolicy: "redirect-to-https"
+                CacheBehaviors:
+                  -
+                    AllowedMethods:
+                      - "HEAD"
+                      - "GET"
+                    Compress: true
+                    CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+                    OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+                    LambdaFunctionAssociations:
+                      -
+                        EventType: "origin-request"
+                        LambdaFunctionARN: !Ref IndexGenLambdaFunctionVersion
+                      -
+                        EventType: "viewer-request"
+                        LambdaFunctionARN: !Ref BasicAuthLambdaFunctionVersion
+                    PathPattern: "*/"
+                    SmoothStreaming: false
+                    TargetOriginId: !Sub "S3-${S3Bucket}"
+                    ViewerProtocolPolicy: "redirect-to-https"
+                  -
+                    AllowedMethods:
+                      - "HEAD"
+                      - "GET"
+                    Compress: true
+                    CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+                    OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+                    LambdaFunctionAssociations:
+                      -
+                        EventType: "origin-request"
+                        LambdaFunctionARN: !Ref IndexGenLambdaFunctionVersion
+                      -
+                        EventType: "viewer-request"
+                        LambdaFunctionARN: !Ref BasicAuthLambdaFunctionVersion
+                    PathPattern: "*index.html"
+                    SmoothStreaming: false
+                    TargetOriginId: !Sub "S3-${S3Bucket}"
+                    ViewerProtocolPolicy: "redirect-to-https"
+                CustomErrorResponses:
+                  -
+                    ErrorCode: 403
+                    ResponsePagePath: "/404.html"
+                    ResponseCode: "404"
+                    ErrorCachingMinTTL: 10
+                  -
+                    ErrorCode: 503
+                    ResponsePagePath: "/404.html"
+                    ResponseCode: "400"
+                    ErrorCachingMinTTL: 10
+                Comment: ""
+                PriceClass: "PriceClass_100"
+                Enabled: true
+                Restrictions:
+                    GeoRestriction:
+                        RestrictionType: "none"
+                HttpVersion: "http2"
+                DefaultRootObject: "/index.html"
+                IPV6Enabled: true
+
+    BasicAuthLambdaFunctionVersion:
+        Type: "AWS::Lambda::Version"
+        Properties:
+            Description: "Version published for Lambda@Edge"
+            FunctionName: !Ref BasicAuthLambdaFunction
+
+    IndexGenLambdaFunctionVersion:
+        Type: "AWS::Lambda::Version"
+        Properties:
+            Description: "Version published for Lambda@Edge"
+            FunctionName: !Ref IndexGenLambdaFunction
+
+    RedirectToBareLambdaFunctionVersion:
+        Type: "AWS::Lambda::Version"
+        Properties:
+            Description: "Version published for Lambda@Edge"
+            FunctionName: !Ref RedirectToBareLambdaFunction
+
+    RedirectHtmlRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${S3Bucket}-redirect-bare-to-index-html-role"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":[\"lambda.amazonaws.com\",\"edgelambda.amazonaws.com\"]},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns:
+              - !Ref IAMManagedPolicy
+
+    IndexGenRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${S3Bucket}-s3-get-index-html-gen-role"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":[\"lambda.amazonaws.com\",\"edgelambda.amazonaws.com\"]},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns:
+              - !Ref IAMManagedPolicy
+
+    BasicAuthRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            Path: "/service-role/"
+            RoleName: !Sub "${S3Bucket}-basic-auth-role"
+            AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":[\"lambda.amazonaws.com\",\"edgelambda.amazonaws.com\"]},\"Action\":\"sts:AssumeRole\"}]}"
+            MaxSessionDuration: 3600
+            ManagedPolicyArns:
+              - !Ref BasicAuthPolicy
+              - !Ref IAMManagedPolicy
+
+    CloudFrontCloudFrontOriginAccessIdentity:
+        Type: "AWS::CloudFront::CloudFrontOriginAccessIdentity"
+        Properties:
+            CloudFrontOriginAccessIdentityConfig:
+                Comment: !Sub "access-identity-${S3Bucket}"
+
+    CloudFrontOriginRequestPolicy:
+        Type: "AWS::CloudFront::OriginRequestPolicy"
+        Properties:
+            OriginRequestPolicyConfig:
+                Name: "send_query_string"
+                Comment: ""
+                HeadersConfig:
+                    HeaderBehavior: "none"
+                CookiesConfig:
+                    CookieBehavior: "none"
+                QueryStringsConfig:
+                    QueryStringBehavior: "all"
+
+Outputs:
+  DistributionId:
+    Value: !GetAtt CloudFrontDistribution.Id
+  DistributionDomain:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  BucketName:
+    Value: !Ref S3Bucket
+  BucketArn:
+    Value: !GetAtt S3Bucket.Arn
+  BucketRegion:
+    Value: !Ref "AWS::Region"
