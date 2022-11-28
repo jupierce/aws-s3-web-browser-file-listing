@@ -24,7 +24,6 @@ from urllib.parse import unquote
 # redirected to the URL followed by a trailing "/" so that they will
 # receive a directory listing instead of an error.
 
-
 def lambda_handler(event, context):
     request = event['Records'][0]['cf']['request']
     uri = request['uri']

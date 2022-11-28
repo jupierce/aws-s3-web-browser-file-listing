@@ -137,6 +137,6 @@ def lambda_handler(event: Dict, context: Dict):
     # in order for the URL to resolve via an S3 HTTP request. decoding and then
     # re-encoding should ensure that clients that do or don't encode will always
     # head toward the S3 origin encoded.
-    request['uri'] = quote(unquote_plus(uri))
+    request['URI'] = quote(unquote_plus(uri))
     return request
 
